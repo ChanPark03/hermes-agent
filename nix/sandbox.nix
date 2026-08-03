@@ -49,6 +49,7 @@
   slirp4netns,
   stdenv,
   gnutar,
+  util-linux,
 
   # etc
   writeShellApplication,
@@ -108,6 +109,7 @@ writeShellApplication {
     slirp4netns
     stdenv.cc
     gnutar
+    util-linux
   ]
   ++ electronRuntime;
   text = ''

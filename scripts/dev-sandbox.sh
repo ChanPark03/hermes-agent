@@ -1,19 +1,51 @@
 #!/usr/bin/env bash
 # Run a command in a disposable, network-isolated fake Internet.
 #
-# The command runs in bubblewrap's private user, mount, PID, and network
-# namespaces.  Its only writable filesystem is SANDBOX_ROOT.  HTTP(S) goes to
-# a local static MITM proxy. github.com SSH uses a sandbox-local git-upload-pack
-# shim; neither transport can reach the host network.
+# The command runs in private user, mount, PID, and network namespaces (the
+# user+net pair from `unshare`, the rest from bubblewrap — see the namespace
+# plan near the bottom).  Its only writable filesystem is SANDBOX_ROOT.
+# HTTP(S) goes to a local static MITM proxy. github.com SSH uses a
+# sandbox-local git-upload-pack shim; neither transport can reach the host
+# network.
 
 set -euo pipefail
 
-if [ "${1:-}" = "--internal-run" ]; then
+# Stage 2: we are already inside the user+network namespaces that stage 1
+# created, at the target uid. bwrap therefore does NOT create a userns here —
+# it only needs the mount/pid namespaces. (`unshare --user` grants its creator
+# full capabilities in the new userns regardless of the uid it maps to, which
+# is what lets bwrap mount as a non-root uid.)
+if [ "${1:-}" = "--internal-sandbox" ]; then
   shift
   : "${DEV_SANDBOX_ROOT:?missing DEV_SANDBOX_ROOT}"
   : "${DEV_SANDBOX_BASH:?missing DEV_SANDBOX_BASH}"
-  : "${DEV_SANDBOX_SLIRP4NETNS:?missing DEV_SANDBOX_SLIRP4NETNS}"
   : "${DEV_SANDBOX_INTERACTIVE:?missing DEV_SANDBOX_INTERACTIVE}"
+  : "${DEV_SANDBOX_USER:?missing DEV_SANDBOX_USER}"
+  : "${DEV_SANDBOX_HOME:?missing DEV_SANDBOX_HOME}"
+
+  # Announce our pid so stage 1 can point slirp4netns at these namespaces,
+  # then hold until it reports the network is up.
+  slirp_ready="$DEV_SANDBOX_ROOT/root/logs/slirp.ready"
+  printf '%s\n' "$$" > "$DEV_SANDBOX_ROOT/root/logs/sandbox.pid"
+  for _ in $(seq 1 200); do
+    [ -s "$slirp_ready" ] && break
+    sleep 0.05
+  done
+  if [ ! -s "$slirp_ready" ]; then
+    echo 'error: timed out waiting for sandbox network setup' >&2
+    cat "$DEV_SANDBOX_ROOT/root/logs/slirp.log" >&2 || true
+    exit 1
+  fi
+
+  # The sandbox HOME is /root for a root install and /home/<user> for a
+  # user-level one. Only the latter needs its parent created first; --dir /
+  # is not a thing bwrap accepts.
+  home_mounts=()
+  home_parent="$(dirname "$DEV_SANDBOX_HOME")"
+  if [ "$home_parent" != / ]; then
+    home_mounts+=(--dir "$home_parent")
+  fi
+  home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
   node_env=()
   if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
@@ -52,10 +84,8 @@ if [ "${1:-}" = "--internal-run" ]; then
     done
   fi
 
-  sandbox_info="$DEV_SANDBOX_ROOT/root/logs/bwrap-info.json"
-  : > "$sandbox_info"
-  bwrap \
-    --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net \
+  exec bwrap \
+    --unshare-pid \
     --die-with-parent --proc /proc --dev /dev --tmpfs /tmp \
     "${gui_mounts[@]}" \
     "${runtime_mounts[@]}" \
@@ -67,14 +97,14 @@ if [ "${1:-}" = "--internal-run" ]; then
     --bind "$DEV_SANDBOX_ROOT/root/lib64" /lib64 \
     --bind "$DEV_SANDBOX_ROOT/root/usr/bin" /usr/bin \
     --bind "$DEV_SANDBOX_ROOT/root/usr/local" /usr/local \
-    --bind "$DEV_SANDBOX_ROOT/home" /root \
+    "${home_mounts[@]}" \
     --bind "$DEV_SANDBOX_ROOT/etc" /etc \
     --chdir /work/repo \
     --clearenv \
-    --setenv PATH "/usr/local/bin:/usr/bin:$PATH" \
-    --setenv HOME /root \
-    --setenv USER root \
-    --setenv LOGNAME root \
+    --setenv PATH "$DEV_SANDBOX_HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH" \
+    --setenv HOME "$DEV_SANDBOX_HOME" \
+    --setenv USER "$DEV_SANDBOX_USER" \
+    --setenv LOGNAME "$DEV_SANDBOX_USER" \
     --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
     --setenv SSL_CERT_FILE /work/certs/ca.pem \
     --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
@@ -87,7 +117,6 @@ if [ "${1:-}" = "--internal-run" ]; then
     --setenv ELECTRON_DISABLE_SANDBOX 1 \
     "${node_env[@]}" \
     "${electron_env[@]}" \
-    --info-fd 3 \
     -- "$DEV_SANDBOX_BASH" -ceu '
       python3 /work/proxy.py /work/http /work/certs /work/certs/real-ca.pem >/work/logs/proxy.log 2>&1 &
       proxy_pid=$!
@@ -105,46 +134,7 @@ if [ "${1:-}" = "--internal-run" ]; then
         exit 1
       fi
       "$@"
-    ' sandbox-command "$@" 3>"$sandbox_info" &
-  bwrap_pid=$!
-  for _ in $(seq 1 100); do
-    [ -s "$sandbox_info" ] && break
-    if ! kill -0 "$bwrap_pid" 2>/dev/null; then
-      wait "$bwrap_pid"
-      exit $?
-    fi
-    sleep 0.05
-  done
-  sandbox_pid="$(awk -F: '/"child-pid"/ {gsub(/[^0-9]/, "", $2); print $2}' "$sandbox_info")"
-  if [ -z "$sandbox_pid" ]; then
-    echo 'error: Bubblewrap did not report a sandbox child PID' >&2
-    exit 1
-  fi
-  slirp_ready="$DEV_SANDBOX_ROOT/root/logs/slirp.ready"
-  : > "$slirp_ready"
-  "$DEV_SANDBOX_SLIRP4NETNS" --configure --disable-host-loopback --ready-fd=3 \
-    --userns-path="/proc/$sandbox_pid/ns/user" "$sandbox_pid" tap0 \
-    3>"$slirp_ready" >"$DEV_SANDBOX_ROOT/root/logs/slirp.log" 2>&1 &
-  slirp_pid=$!
-  cleanup() {
-    kill "$slirp_pid" 2>/dev/null || true
-    wait "$slirp_pid" 2>/dev/null || true
-  }
-  trap cleanup EXIT INT TERM
-  for _ in $(seq 1 100); do
-    [ -s "$slirp_ready" ] && break
-    if ! kill -0 "$slirp_pid" 2>/dev/null; then
-      cat "$DEV_SANDBOX_ROOT/root/logs/slirp.log" >&2 || true
-      exit 1
-    fi
-    sleep 0.05
-  done
-  if [ ! -s "$slirp_ready" ]; then
-    echo 'error: timed out waiting for sandbox network setup' >&2
-    exit 1
-  fi
-  wait "$bwrap_pid"
-  exit $?
+    ' sandbox-command "$@"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -160,6 +150,9 @@ writable host mounts: only its own root, mounted at /work, is writable.
 Options:
   --persistent          Keep the whole sandbox under .hermes-sandbox/.
   --delete              Delete the persistent sandbox (asks first).
+  --root                Install as uid 0 with the root FHS layout: code in
+                        /usr/local/lib/hermes-agent, command in
+                        /usr/local/bin. Default is the user-level layout.
   --from DIR            One-time copy of DIR into the sandbox's $HOME.
                         Existing persistent sandboxes are never overwritten.
   --http-root DIR       Copy DIR into the fake web server root for this run.
@@ -170,6 +163,25 @@ Options:
                         and repository, then advance fake main to this folder
                         after a successful install for update testing.
   -h, --help            Show this help.
+
+Option order matters: every option above is consumed by THIS script, and
+parsing stops at the first argument it does not recognize. Everything from
+that point on is passed through to the command (or, with `install`, to the
+installer). Put sandbox options first and separate installer arguments with
+`--`, otherwise they arrive here and fail:
+
+  # WRONG — --from-main reaches install.sh, which rejects it
+  scripts/dev-sandbox.sh install --skip-setup --from-main
+
+  # RIGHT
+  scripts/dev-sandbox.sh install --from-main -- --skip-setup
+
+Install layout: `install.sh` picks its layout from `id -u` alone, so uid is what
+separates the two real-world Linux installs. By default the sandbox runs as an
+unprivileged `hermes` user, giving the layout most people have —
+$HERMES_HOME/hermes-agent plus a ~/.local/bin launcher. Pass --root for the FHS
+one. Both are worth testing; they differ in more than paths (root also relocates
+uv's Python to /usr/local/share for world-readability).
 
 The fake web server signs certificates with a CA trusted only inside this
 sandbox. HTTP_PROXY/HTTPS_PROXY send fixture URLs there first; other HTTP(S)
@@ -184,7 +196,7 @@ commit containing them; it never stages or commits the real worktree.
 Examples:
   # create a sandbox, install this branch as `main`, and then drop to a shell,
   # skipping `hermes setup` & the browser tools for speed.
-  scripts/dev-sandbox.sh install --persistent --skip-setup --skip-browser
+  scripts/dev-sandbox.sh install --persistent -- --skip-setup --skip-browser
 
   # Install the official upstream main. You're dropped into a shell where
   # you can run `hermes update`.
@@ -195,6 +207,7 @@ EOF
 
 PERSISTENT=false
 DELETE=false
+RUN_AS_USER=true
 SEED_DIR=""
 HTTP_ROOT=""
 INSTALL_SHORTCUT=false
@@ -210,6 +223,8 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --persistent) PERSISTENT=true; shift ;;
     --delete) DELETE=true; shift ;;
+    --root) RUN_AS_USER=false; shift ;;
+    --user) RUN_AS_USER=true; shift ;;   # the default; accepted for symmetry
     --from)
       [ "$#" -ge 2 ] || { echo 'error: --from needs a directory' >&2; exit 1; }
       SEED_DIR="$2"; shift 2 ;;
@@ -396,8 +411,37 @@ ln -sf "$SANDBOX_SHELL" "$SANDBOX_ROOT/root/bin/sh"
 ln -sf "$(command -v ls)" "$SANDBOX_ROOT/root/bin/ls"
 ln -sf "$(command -v env)" "$SANDBOX_ROOT/root/usr/bin/env"
 ln -sf "$DYNAMIC_LINKER" "$SANDBOX_ROOT/root/lib64/$(basename "$DYNAMIC_LINKER")"
-printf 'root:x:0:0:Sandbox Root:/root:%s\n' "$SANDBOX_SHELL" > "$SANDBOX_ROOT/etc/passwd"
-printf 'root:x:0:\n' > "$SANDBOX_ROOT/etc/group"
+# Identity inside the sandbox. install.sh chooses its layout from `id -u`
+# alone (see resolve_install_layout), so the uid here is what decides between
+# the root FHS install and a user-level one.
+if [ "$RUN_AS_USER" = true ]; then
+  SANDBOX_UID=1000
+  SANDBOX_GID=1000
+  SANDBOX_USER=hermes
+  SANDBOX_HOME=/home/hermes
+else
+  SANDBOX_UID=0
+  SANDBOX_GID=0
+  SANDBOX_USER=root
+  SANDBOX_HOME=/root
+fi
+{
+  printf 'root:x:0:0:Sandbox Root:/root:%s\n' "$SANDBOX_SHELL"
+  if [ "$RUN_AS_USER" = true ]; then
+    printf '%s:x:%s:%s:Sandbox User:%s:%s\n' \
+      "$SANDBOX_USER" "$SANDBOX_UID" "$SANDBOX_GID" "$SANDBOX_HOME" "$SANDBOX_SHELL"
+  fi
+} > "$SANDBOX_ROOT/etc/passwd"
+{
+  printf 'root:x:0:\n'
+  if [ "$RUN_AS_USER" = true ]; then
+    printf '%s:x:%s:\n' "$SANDBOX_USER" "$SANDBOX_GID"
+  fi
+} > "$SANDBOX_ROOT/etc/group"
+# A user-level install writes the `hermes` launcher to ~/.local/bin and the
+# checkout to $HERMES_HOME; both live under the sandbox HOME, which is bound
+# from $SANDBOX_ROOT/home. bwrap maps our real uid to $SANDBOX_UID, so the
+# host-side ownership of that directory is what the sandbox sees as its own.
 printf 'hosts: files dns\n' > "$SANDBOX_ROOT/etc/nsswitch.conf"
 printf '127.0.0.1 localhost\n' > "$SANDBOX_ROOT/etc/hosts"
 
@@ -597,9 +641,14 @@ else
 fi
 echo "[sandbox] root: $SANDBOX_ROOT" >&2
 echo "[sandbox] http root: $SANDBOX_ROOT/root/http" >&2
+if [ "$RUN_AS_USER" = true ]; then
+  echo "[sandbox] identity: $SANDBOX_USER (uid $SANDBOX_UID) — installs are user-level under $SANDBOX_HOME" >&2
+else
+  echo '[sandbox] identity: root (uid 0) — installs use the /usr/local FHS layout' >&2
+fi
 [ "$PERSISTENT" = true ] && echo '[sandbox] persistent' >&2 || echo '[sandbox] ephemeral' >&2
 
-for command in awk bash bwrap curl git nc openssl python3 slirp4netns tar; do
+for command in awk bash bwrap curl git nc openssl python3 slirp4netns tar unshare; do
   command -v "$command" >/dev/null || {
     echo "error: missing required command: $command" >&2
     exit 1
@@ -620,15 +669,101 @@ if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
   WAYLAND_SOCKET="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
 fi
 
-exec env \
+# Namespace plan (stage 1 -> stage 2).
+#
+# slirp4netns joins the target's userns and setuids to root before configuring
+# the netns, so the userns MUST map a uid 0 — bwrap's own --unshare-user maps
+# exactly one uid, which is why running the payload as uid 1000 used to fail
+# with setns(CLONE_NEWNET): Operation not permitted.
+#
+# So we build the namespaces here with two ranges instead:
+#   inner 0    <- a subuid, unused by the payload, present only so slirp can
+#                become root inside the namespace
+#   inner $SANDBOX_UID <- our real host uid, so everything the sandbox writes
+#                stays owned by us and `rm -rf` on a persistent sandbox needs
+#                no privileges or chown dance
+# The payload then runs in stage 2, where bwrap adds the mount/pid namespaces
+# without creating a userns at all.
+#
+# The root layout needs no subuid at all: inner 0 IS the host uid there.
+netns_args=(--user --net)
+if [ "$RUN_AS_USER" = true ]; then
+  host_user="$(id -un)"
+  subuid_base="$(awk -F: -v u="$host_user" '$1 == u {print $2; exit}' /etc/subuid)"
+  subgid_base="$(awk -F: -v u="$host_user" '$1 == u {print $2; exit}' /etc/subgid)"
+  if [ -z "$subuid_base" ] || [ -z "$subgid_base" ]; then
+    echo "error: no /etc/subuid or /etc/subgid range for $host_user" >&2
+    echo '       A user-level sandbox needs one spare subordinate id to host' >&2
+    echo "       its internal root. Add e.g. '$host_user:100000:65536' to both," >&2
+    echo '       or use --root.' >&2
+    exit 1
+  fi
+  netns_args+=(
+    --map-users="0:$subuid_base:1" --map-users="$SANDBOX_UID:$(id -u):1"
+    --map-groups="0:$subgid_base:1" --map-groups="$SANDBOX_GID:$(id -g):1"
+  )
+else
+  netns_args+=(--map-root-user)
+fi
+
+sandbox_pid_file="$SANDBOX_ROOT/root/logs/sandbox.pid"
+slirp_ready="$SANDBOX_ROOT/root/logs/slirp.ready"
+slirp_log="$SANDBOX_ROOT/root/logs/slirp.log"
+: > "$sandbox_pid_file"
+: > "$slirp_ready"
+
+env \
   DEV_SANDBOX_ROOT="$SANDBOX_ROOT" \
   DEV_SANDBOX_BASH="$(command -v bash)" \
-  DEV_SANDBOX_SLIRP4NETNS="$(command -v slirp4netns)" \
   DEV_SANDBOX_REAL_CA_CERT="$REAL_CA_CERT" \
   DEV_SANDBOX_INTERACTIVE="$INTERACTIVE" \
+  DEV_SANDBOX_USER="$SANDBOX_USER" \
+  DEV_SANDBOX_HOME="$SANDBOX_HOME" \
   DEV_SANDBOX_NODE_DIR="$NODE_DIR" \
   DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH="${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" \
   DEV_SANDBOX_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
   DEV_SANDBOX_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
   DEV_SANDBOX_WAYLAND_SOCKET="$WAYLAND_SOCKET" \
-  "$BASH_SOURCE" --internal-run "$@"
+  unshare "${netns_args[@]}" \
+    "$BASH_SOURCE" --internal-sandbox "$@" &
+sandbox_launcher=$!
+
+for _ in $(seq 1 200); do
+  [ -s "$sandbox_pid_file" ] && break
+  if ! kill -0 "$sandbox_launcher" 2>/dev/null; then
+    wait "$sandbox_launcher"
+    exit $?
+  fi
+  sleep 0.05
+done
+sandbox_pid="$(tr -dc '0-9' < "$sandbox_pid_file")"
+if [ -z "$sandbox_pid" ]; then
+  echo 'error: sandbox did not report its PID' >&2
+  exit 1
+fi
+
+slirp4netns --configure --disable-host-loopback --ready-fd=3 \
+  --userns-path="/proc/$sandbox_pid/ns/user" "$sandbox_pid" tap0 \
+  3>"$slirp_ready" >"$slirp_log" 2>&1 &
+slirp_pid=$!
+cleanup_slirp() {
+  kill "$slirp_pid" 2>/dev/null || true
+  wait "$slirp_pid" 2>/dev/null || true
+}
+trap cleanup_slirp EXIT INT TERM
+
+for _ in $(seq 1 200); do
+  [ -s "$slirp_ready" ] && break
+  if ! kill -0 "$slirp_pid" 2>/dev/null; then
+    cat "$slirp_log" >&2 || true
+    exit 1
+  fi
+  sleep 0.05
+done
+if [ ! -s "$slirp_ready" ]; then
+  echo 'error: timed out waiting for sandbox network setup' >&2
+  exit 1
+fi
+
+wait "$sandbox_launcher"
+exit $?
