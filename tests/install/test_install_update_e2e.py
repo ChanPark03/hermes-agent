@@ -132,11 +132,10 @@ def _missing_requirement() -> str | None:
     return None
 
 
+_SKIP_REASON = _missing_requirement()
+
 pytestmark = [
-    pytest.mark.skipif(
-        _missing_requirement() is not None,
-        reason=_missing_requirement() or "",
-    ),
+    pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or ""),
     # tests/conftest.py's live-system guard blocks subprocesses that look like
     # they would mutate the developer's real install -- and `hermes update` is
     # exactly that shape. Here the command only ever reaches a throwaway
@@ -185,6 +184,14 @@ def _sandbox_shell(script: str, what: str) -> str:
     if completed.returncode != 0 or MARKER_OK not in completed.stdout:
         _fail(completed, what)
     return completed.stdout
+
+
+def _field(output: str, key: str) -> str:
+    """Pull a ``key=value`` line out of sandbox output."""
+    for line in output.splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    raise AssertionError(f"no {key}= line in sandbox output:\n{output}")
 
 
 def _install(from_main: bool, what: str) -> subprocess.CompletedProcess:
@@ -240,14 +247,6 @@ echo {MARKER_OK}
     yield base
 
     shutil.rmtree(sandbox_root, ignore_errors=True)
-
-
-def _field(output: str, key: str) -> str:
-    """Pull a ``key=value`` line out of sandbox output."""
-    for line in output.splitlines():
-        if line.startswith(f"{key}="):
-            return line.split("=", 1)[1].strip()
-    raise AssertionError(f"no {key}= line in sandbox output:\n{output}")
 
 
 def _reset_to(commit: str) -> None:
