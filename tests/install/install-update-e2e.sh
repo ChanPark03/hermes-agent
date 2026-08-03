@@ -64,6 +64,22 @@ step() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# The sandbox's internal logs (fake-internet proxy, slirp) explain failures that
+# happen BEFORE install.sh gets to say anything -- a TLS handshake the proxy
+# rejected looks like a bare `curl: (35)` from outside. Copy them out where a CI
+# artifact upload can find them, and echo the proxy log since it is the usual
+# culprit.
+collect_sandbox_logs() {
+  local tag="$1" src="$SANDBOX_ROOT/root/logs" dest="$LOG_DIR/sandbox-$tag"
+  [ -d "$src" ] || return 0
+  mkdir -p "$dest"
+  cp -a "$src/." "$dest/" 2>/dev/null || true
+  if [ -s "$dest/proxy.log" ]; then
+    echo "--- sandbox proxy.log (last 40 lines) ---" >&2
+    tail -40 "$dest/proxy.log" >&2
+  fi
+}
+
 # ── preflight ──────────────────────────────────────────────────────────────
 # Prefer the `sandbox` wrapper from the Nix devShell: it supplies both the PATH
 # (bwrap, slirp4netns, openssl, ...) and the DEV_SANDBOX_* variables the script
@@ -108,10 +124,12 @@ install_in_sandbox() {
   if ! "${SANDBOX[@]}" "${args[@]}" >"$log" 2>&1; then
     echo "--- last 40 lines of $log ---" >&2
     tail -40 "$log" >&2
+    collect_sandbox_logs "$3"
     fail "$what failed"
   fi
   grep -q 'Installation Complete' "$log" \
-    || { tail -40 "$log" >&2; fail "$what did not report a completed install"; }
+    || { tail -40 "$log" >&2; collect_sandbox_logs "$3"; \
+         fail "$what did not report a completed install"; }
   ok "$what completed (log: $log)"
 }
 
