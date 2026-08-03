@@ -396,7 +396,18 @@ printf 'nameserver 10.0.2.3\n' > "$SANDBOX_ROOT/etc/resolv.conf"
 SANDBOX_SHELL="$(command -v bash)"
 DYNAMIC_LINKER="${DEV_SANDBOX_DYNAMIC_LINKER:-}"
 if [ -z "$DYNAMIC_LINKER" ]; then
-  for candidate in /nix/store/*-glibc-*/lib/ld-linux-*.so.*; do
+  # Nix store first: NixOS also ships a /lib64/ld-linux-x86-64.so.2 compat stub,
+  # so probing FHS paths first would quietly switch which loader a bare script
+  # invocation uses on this host. Globs that match nothing expand to themselves,
+  # so every candidate is -f tested. The FHS paths cover Debian/Ubuntu (where
+  # the loader is under /lib64 or a multiarch /lib dir), which is what CI runs.
+  for candidate in \
+    /nix/store/*-glibc-*/lib/ld-linux-*.so.* \
+    /lib64/ld-linux-x86-64.so.2 \
+    /lib/ld-linux-aarch64.so.1 \
+    /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+    /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+  do
     if [ -f "$candidate" ]; then
       DYNAMIC_LINKER="$candidate"
       break
@@ -405,6 +416,7 @@ if [ -z "$DYNAMIC_LINKER" ]; then
 fi
 if [ ! -f "$DYNAMIC_LINKER" ]; then
   echo 'error: no glibc dynamic linker found for sandboxed release binaries' >&2
+  echo '       Set DEV_SANDBOX_DYNAMIC_LINKER to its path.' >&2
   exit 1
 fi
 ln -sf "$SANDBOX_SHELL" "$SANDBOX_ROOT/root/bin/sh"
