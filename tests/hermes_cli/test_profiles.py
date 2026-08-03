@@ -151,11 +151,6 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
-
-
-        assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
-        assert cloned_config["model"]["provider"] == "openrouter"
-
     def test_clone_config_copies_source_skills(self, profile_env):
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"

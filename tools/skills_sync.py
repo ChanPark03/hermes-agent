@@ -916,6 +916,14 @@ def sync_skills(quiet: bool = False) -> dict:
             # still protects local edits before any overwrite.
             if origin_hash and bundled_hash == origin_hash:
                 skipped += 1
+                # Migration for installs that predate the writable-copy fix:
+                # the user copy may still carry read-only mode bits inherited
+                # from a Nix-store bundled source when it was first copied.
+                # This fast path (added in #72622) deliberately skips hashing
+                # the user's copy, so it is the branch a pre-fix install
+                # actually lands on every sync — repair the mode here or the
+                # skill stays unwritable forever.
+                _make_tree_owner_writable(dest)
                 continue
 
             user_hash = _dir_hash(dest)
