@@ -73,15 +73,34 @@ if [ "${1:-}" = "--internal-sandbox" ]; then
     )
   fi
 
+  # How the sandbox gets a usable runtime, and where its own shims go.
+  #
+  # On Nix, every binary lives under /nix/store, so the sandbox can own /bin,
+  # /lib64 and /usr/bin outright and fill them with symlinks into the store.
+  #
+  # Elsewhere the runtime IS /usr, /bin, /lib, /lib64 -- so binding the
+  # sandbox's near-empty versions over them hides the real thing, and bwrap
+  # dies with `execvp /usr/bin/bash: No such file or directory`. Keep the host
+  # directories read-only and override only the individual files we shim.
   runtime_mounts=()
+  shim_mounts=()
   if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
     runtime_mounts+=(--ro-bind /nix /nix)
+    shim_mounts+=(
+      --dir /usr
+      --dir /bin
+      --dir /lib64
+      --bind "$DEV_SANDBOX_ROOT/root/bin" /bin
+      --bind "$DEV_SANDBOX_ROOT/root/lib64" /lib64
+      --bind "$DEV_SANDBOX_ROOT/root/usr/bin" /usr/bin
+    )
   else
-    # Non-Nix Linux distributions keep dynamic executables and their loaders
-    # below these system paths.  They are read-only in the sandbox.
     for path in /usr /bin /sbin /lib /lib64; do
       [ -e "$path" ] && runtime_mounts+=(--ro-bind "$path" "$path")
     done
+    # The git-upload-pack shim standing in for github.com is the only file that
+    # must beat the host's copy; sh/ls/env are already there for real.
+    shim_mounts+=(--bind "$DEV_SANDBOX_ROOT/root/usr/bin/ssh" /usr/bin/ssh)
   fi
 
   exec bwrap \
@@ -89,13 +108,8 @@ if [ "${1:-}" = "--internal-sandbox" ]; then
     --die-with-parent --proc /proc --dev /dev --tmpfs /tmp \
     "${gui_mounts[@]}" \
     "${runtime_mounts[@]}" \
-    --dir /usr \
-    --dir /bin \
-    --dir /lib64 \
     --bind "$DEV_SANDBOX_ROOT/root" /work \
-    --bind "$DEV_SANDBOX_ROOT/root/bin" /bin \
-    --bind "$DEV_SANDBOX_ROOT/root/lib64" /lib64 \
-    --bind "$DEV_SANDBOX_ROOT/root/usr/bin" /usr/bin \
+    "${shim_mounts[@]}" \
     --bind "$DEV_SANDBOX_ROOT/root/usr/local" /usr/local \
     "${home_mounts[@]}" \
     --bind "$DEV_SANDBOX_ROOT/etc" /etc \
