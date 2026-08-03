@@ -69,45 +69,20 @@ jobs:
           set -euo pipefail
           scripts/dev-sandbox.sh bash -c 'echo "sandbox ok as uid $(id -u)"'
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
-        with:
-          version: '0.9.28'
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      # The suite itself only needs pytest; the heavy dependency install
-      # happens INSIDE the sandbox, by the real installer under test.
-      - name: Install test dependencies
-        uses: ./.github/actions/retry
-        with:
-          command: uv sync --locked --python 3.11 --extra dev
-
       - name: Run install + update E2E
         run: |
           set -euo pipefail
-          source .venv/bin/activate
-          python -m pytest tests/install/ -v -rs --no-header --tb=short
+          tests/install/install-update-e2e.sh
         env:
-          HERMES_RUN_INSTALL_E2E: '1'
-          # No real credentials: the installer must not need any, and a leak
-          # here would let a test spend money.
-          OPENROUTER_API_KEY: ''
-          OPENAI_API_KEY: ''
-          NOUS_API_KEY: ''
+          HERMES_E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
 
-      # The sandbox keeps the installer's own logs; they say far more than
-      # pytest's assertion when a real install breaks.
-      - name: Upload sandbox logs
+      # The installer's own transcripts say far more than the assertion that
+      # tripped when a real install breaks.
+      - name: Upload installer logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-e2e-logs-${{ github.sha }}
-          path: .hermes-sandbox-e2e/root/logs
+          path: e2e-logs
           retention-days: 14
           if-no-files-found: ignore
