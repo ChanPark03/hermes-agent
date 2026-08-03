@@ -56,9 +56,9 @@ FAKE_REMOTE="/work/repos/hermes-agent.git"
 
 # Installer transcripts live outside the sandbox root: the sandbox is recreated
 # and (unless --keep) deleted, and these logs are the most useful artifact when
-# a real install breaks.
+# a real install breaks. Created after the dirty check below, so that a log dir
+# pointed inside the repo cannot be the thing that makes the tree dirty.
 LOG_DIR="${HERMES_E2E_LOG_DIR:-$(mktemp -d -t hermes-install-e2e-logs.XXXXXX)}"
-mkdir -p "$LOG_DIR"
 
 step() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
@@ -79,10 +79,15 @@ else
 fi
 
 if [ -n "$(git status --porcelain)" ]; then
-  fail 'working tree is dirty. Every sandbox invocation re-snapshots the working
-  copy into a new fake-main commit, so the update target would move mid-run.
-  Commit or stash first.'
+  printf '\033[1;31m✗ working tree is dirty:\033[0m\n' >&2
+  git status --porcelain | sed 's/^/    /' >&2
+  fail 'Every sandbox invocation re-snapshots the working copy into a new
+  fake-main commit, so the update target would move mid-run. Commit or stash
+  first. (If a path above is build or log output, it needs gitignoring or to
+  live outside the repo.)'
 fi
+
+mkdir -p "$LOG_DIR"
 
 if [ "$KEEP" = false ]; then
   trap 'rm -rf -- "$SANDBOX_ROOT"' EXIT INT TERM

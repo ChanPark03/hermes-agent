@@ -65,16 +65,28 @@ jobs:
       # Fail fast with a clear signal if the runner cannot host bwrap at all,
       # rather than burying it in a 40-minute install failure.
       - name: Verify the sandbox can start
+        env:
+          # Same dir the E2E uses, so this probe cannot leave a second sandbox
+          # tree behind.
+          HERMES_DEV_SANDBOX_DIR: .hermes-sandbox-e2e
         run: |
           set -euo pipefail
           scripts/dev-sandbox.sh bash -c 'echo "sandbox ok as uid $(id -u)"'
+          rm -rf .hermes-sandbox-e2e
+          echo "--- worktree state after the probe (must be clean):"
+          git status --porcelain
 
       - name: Run install + update E2E
         run: |
           set -euo pipefail
           tests/install/install-update-e2e.sh
         env:
-          HERMES_E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
+          # Outside the workspace on purpose: the script creates this directory
+          # up front, and an untracked dir inside the repo makes the worktree
+          # dirty -- which dev-sandbox reacts to by snapshotting the working
+          # copy into a fresh fake-main commit on every invocation, moving the
+          # update target mid-run.
+          HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
 
       # The installer's own transcripts say far more than the assertion that
       # tripped when a real install breaks.
@@ -83,6 +95,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-e2e-logs-${{ github.sha }}
-          path: e2e-logs
+          path: ${{ runner.temp }}/e2e-logs
           retention-days: 14
           if-no-files-found: ignore
