@@ -139,11 +139,16 @@ if [ "${1:-}" = "--internal-sandbox" ]; then
         wait "$proxy_pid" 2>/dev/null || true
       }
       trap cleanup EXIT INT TERM
-      for _ in $(seq 1 50); do
-        nc -z 127.0.0.1 8080 && break
+      # Bash opens /dev/tcp itself, so the readiness probe needs no netcat --
+      # one less binary the sandbox has to find on the host (GitHub runners
+      # ship no `nc`).
+      proxy_up() { (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null; }
+      for _ in $(seq 1 100); do
+        proxy_up && break
         sleep 0.05
       done
-      if ! nc -z 127.0.0.1 8080; then
+      if ! proxy_up; then
+        echo "error: the sandbox fake-internet proxy never came up" >&2
         cat /work/logs/proxy.log >&2 || true
         exit 1
       fi
@@ -674,7 +679,7 @@ else
 fi
 [ "$PERSISTENT" = true ] && echo '[sandbox] persistent' >&2 || echo '[sandbox] ephemeral' >&2
 
-for command in awk bash bwrap curl git nc openssl python3 slirp4netns tar unshare; do
+for command in awk bash bwrap curl git openssl python3 slirp4netns tar unshare; do
   command -v "$command" >/dev/null || {
     echo "error: missing required command: $command" >&2
     exit 1
